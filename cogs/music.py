@@ -1,11 +1,18 @@
 """
 Music Cog for Buddy
-Music player with YouTube support
+Music player with YouTube support.
+
+YouTube cookies setup (required for authenticated access):
+1. Export cookies on a machine where you are logged into YouTube:
+   yt-dlp --cookies-from-browser chrome --cookies cookies.txt
+2. Upload/place `cookies.txt` in the bot project root directory (same level as `main.py`) on the VPS.
+3. Refresh cookies regularly (recommended every 7-14 days, or immediately if YouTube starts failing auth checks).
 """
 
 import asyncio
 import logging
 import shutil
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import discord
@@ -32,14 +39,32 @@ YTDL_OPTIONS = {
     "format": "bestaudio/best",
     "noplaylist": True,
     "quiet": True,
+    "no_warnings": True,
     "default_search": "ytsearch1",
     "skip_download": True,
+    "cookiefile": "cookies.txt",
+    "extractor_args": {"youtube": {"player_client": ["android"]}},
+    "sleep_interval_requests": 1,
+    "retries": 2,
 }
 
 FFMPEG_OPTIONS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
     "options": "-vn",
 }
+
+COOKIES_FILE_NAME = "cookies.txt"
+EXTRACTION_RETRIES = 2
+EXTRACTION_RETRY_DELAY_SECONDS = 1.0
+
+
+class TrackExtractionError(Exception):
+    """Raised when a track cannot be extracted from YouTube."""
+
+    def __init__(self, user_message: str, detail: Optional[str] = None, retryable: bool = True):
+        self.user_message = user_message
+        self.retryable = retryable
+        super().__init__(detail or user_message)
 
 
 class MusicQueue:
@@ -78,6 +103,7 @@ class Music(commands.Cog):
         self.queues: Dict[int, MusicQueue] = {}
         self.play_locks: Dict[int, asyncio.Lock] = {}
         self.guild_volumes: Dict[int, float] = {}
+        self.cookies_path = Path(__file__).resolve().parent.parent / COOKIES_FILE_NAME
 
     def get_queue(self, guild_id: int) -> MusicQueue:
         if guild_id not in self.queues:
@@ -109,24 +135,98 @@ class Music(commands.Cog):
         if yt_dlp is None:
             raise RuntimeError("yt-dlp is not installed.")
 
-        return await asyncio.to_thread(self._extract_track_sync, query)
+        if not self.cookies_path.is_file():
+            raise TrackExtractionError(
+                "Missing cookies.txt. Export cookies and place the file in the bot root directory.",
+                f"cookies file not found at: {self.cookies_path}",
+                retryable=False,
+            )
+
+        logger.info(f"Using YouTube cookies from: {self.cookies_path}")
+
+        last_error: Optional[Exception] = None
+        for attempt in range(1, EXTRACTION_RETRIES + 1):
+            try:
+                return await asyncio.to_thread(self._extract_track_sync, query, str(self.cookies_path))
+            except TrackExtractionError as e:
+                last_error = e
+                if attempt < EXTRACTION_RETRIES and e.retryable:
+                    logger.warning(
+                        f"Retrying extraction ({attempt}/{EXTRACTION_RETRIES}) for query '{query}': {e}"
+                    )
+                    await asyncio.sleep(EXTRACTION_RETRY_DELAY_SECONDS)
+                    continue
+                logger.error(f"Extraction failed for query '{query}': {e}")
+                raise
+            except Exception as e:
+                last_error = e
+                if attempt < EXTRACTION_RETRIES:
+                    logger.warning(
+                        f"Retrying extraction ({attempt}/{EXTRACTION_RETRIES}) for query '{query}': {e}"
+                    )
+                    await asyncio.sleep(EXTRACTION_RETRY_DELAY_SECONDS)
+                    continue
+                logger.error(f"Extraction failed for query '{query}': {e}", exc_info=True)
+                raise TrackExtractionError("Could not extract this track from YouTube.", str(e)) from e
+
+        raise TrackExtractionError("Could not extract this track from YouTube.", str(last_error))
 
     @staticmethod
-    def _extract_track_sync(query: str) -> Dict[str, Any]:
-        with yt_dlp.YoutubeDL(YTDL_OPTIONS) as ydl:
-            info = ydl.extract_info(query, download=False)
+    def _classify_extraction_error(raw_error: Exception) -> TrackExtractionError:
+        message = str(raw_error)
+        lowered = message.lower()
+
+        if "sign in to confirm you're not a bot" in lowered or "sign in to confirm you’re not a bot" in lowered:
+            return TrackExtractionError(
+                "YouTube requires sign-in verification. Refresh cookies.txt and try again.",
+                message,
+                retryable=False,
+            )
+        if "http error 429" in lowered or "too many requests" in lowered:
+            return TrackExtractionError(
+                "YouTube rate-limited this request (HTTP 429). Please wait a bit and retry.",
+                message,
+            )
+        if "video unavailable" in lowered:
+            return TrackExtractionError(
+                "This video is unavailable on YouTube.",
+                message,
+                retryable=False,
+            )
+        if "private video" in lowered:
+            return TrackExtractionError(
+                "This is a private video and cannot be played.",
+                message,
+                retryable=False,
+            )
+        return TrackExtractionError("Could not extract this track from YouTube.", message)
+
+    @classmethod
+    def _extract_track_sync(cls, query: str, cookies_path: str) -> Dict[str, Any]:
+        ydl_options = dict(YTDL_OPTIONS)
+        ydl_options["cookiefile"] = cookies_path
+
+        with yt_dlp.YoutubeDL(ydl_options) as ydl:
+            try:
+                info = ydl.extract_info(query, download=False)
+            except Exception as e:
+                raise cls._classify_extraction_error(e) from e
 
             if not info:
-                raise ValueError("No results found")
+                raise TrackExtractionError("No results found for this query.", "No extraction info returned", retryable=False)
 
             if "entries" in info:
                 info = next((entry for entry in info["entries"] if entry), None)
                 if not info:
-                    raise ValueError("No results found")
+                    raise TrackExtractionError("No results found for this query.", "No playable entry in results", retryable=False)
 
             stream_url = info.get("url")
             if not stream_url:
-                raise ValueError("No playable stream URL found")
+                raise TrackExtractionError(
+                    "Could not create a playable stream URL for this track.",
+                    "No playable stream URL found",
+                    retryable=False,
+                )
 
             return {
                 "title": info.get("title") or query,
@@ -303,6 +403,13 @@ class Music(commands.Cog):
 
         try:
             track = await self._extract_track(query)
+        except TrackExtractionError as e:
+            logger.error(f"Failed to resolve track '{query}': {e}")
+            await interaction.followup.send(
+                embed=EmbedFactory.error("Track Error", e.user_message),
+                ephemeral=True,
+            )
+            return
         except Exception as e:
             logger.error(f"Failed to resolve track '{query}': {e}", exc_info=True)
             await interaction.followup.send(
