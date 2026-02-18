@@ -572,7 +572,18 @@ class Music(commands.Cog):
             if vc and vc.channel != user_channel:
                 await vc.move_to(user_channel)
             elif not vc:
-                vc = await user_channel.connect(timeout=20.0, reconnect=True)
+                # Use a longer timeout and self_deaf=True which often helps on VPS
+                vc = await user_channel.connect(timeout=30.0, reconnect=True, self_deaf=True)
+        except asyncio.TimeoutError:
+            logger.error(f"Voice connection timed out for guild {interaction.guild.id}")
+            await interaction.followup.send(
+                embed=EmbedFactory.error(
+                    "Connection Timeout", 
+                    "Discord did not respond to the voice connection request. This is often a temporary Discord issue or VPS network restriction. Try again in a few seconds."
+                ),
+                ephemeral=True,
+            )
+            return
         except Exception as e:
             error_msg = str(e) or "Unknown error (check VPS logs or permissions)"
             logger.error(f"Failed to join voice channel: {error_msg}", exc_info=True)

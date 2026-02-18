@@ -152,6 +152,7 @@ class Buddy(commands.Bot):
         intent_config = bot_config.get('intents', {})
 
         intents = discord.Intents.default()
+        intents.voice_states = True  # Explicitly enable for voice channel monitoring
         intents.message_content = get_bool_setting(
             intent_config.get('message_content', False),
             'DISCORD_INTENT_MESSAGE_CONTENT',
@@ -194,7 +195,8 @@ class Buddy(commands.Bot):
         self.logger.info("Starting Buddy...")
         self.logger.info(
             f"Intents: message_content={self.intents.message_content}, "
-            f"members={self.intents.members}, presences={self.intents.presences}"
+            f"members={self.intents.members}, presences={self.intents.presences}, "
+            f"voice_states={self.intents.voice_states}"
         )
         self._warn_for_disabled_required_intents()
 
