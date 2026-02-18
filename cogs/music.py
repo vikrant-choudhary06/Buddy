@@ -56,6 +56,7 @@ FFMPEG_OPTIONS = {
 COOKIES_FILE_NAME = "cookies.txt"
 EXTRACTION_RETRIES = 2
 EXTRACTION_RETRY_DELAY_SECONDS = 1.0
+FALLBACK_FORMAT = "best"
 
 
 class TrackExtractionError(Exception):
@@ -147,7 +148,7 @@ class Music(commands.Cog):
         last_error: Optional[Exception] = None
         for attempt in range(1, EXTRACTION_RETRIES + 1):
             try:
-                return await asyncio.to_thread(self._extract_track_sync, query, str(self.cookies_path))
+                return await asyncio.to_thread(self._extract_track_sync_with_fallback, query, str(self.cookies_path))
             except TrackExtractionError as e:
                 last_error = e
                 if attempt < EXTRACTION_RETRIES and e.retryable:
@@ -172,11 +173,30 @@ class Music(commands.Cog):
         raise TrackExtractionError("Could not extract this track from YouTube.", str(last_error))
 
     @staticmethod
+    def _is_requested_format_unavailable(raw_error: Exception) -> bool:
+        return "requested format is not available" in str(raw_error).lower()
+
+    @classmethod
+    def _extract_track_sync_with_fallback(cls, query: str, cookies_path: str) -> Dict[str, Any]:
+        try:
+            return cls._extract_track_sync(query, cookies_path)
+        except TrackExtractionError as primary_error:
+            if not cls._is_requested_format_unavailable(primary_error):
+                raise
+
+            logger.warning(
+                "Primary yt-dlp format failed for query '%s'. Falling back to format '%s'.",
+                query,
+                FALLBACK_FORMAT,
+            )
+            return cls._extract_track_sync(query, cookies_path, format_override=FALLBACK_FORMAT)
+
+    @staticmethod
     def _classify_extraction_error(raw_error: Exception) -> TrackExtractionError:
         message = str(raw_error)
         lowered = message.lower()
 
-        if "sign in to confirm you're not a bot" in lowered or "sign in to confirm you’re not a bot" in lowered:
+        if "sign in to confirm you're not a bot" in lowered:
             return TrackExtractionError(
                 "YouTube requires sign-in verification. Refresh cookies.txt and try again.",
                 message,
@@ -199,12 +219,25 @@ class Music(commands.Cog):
                 message,
                 retryable=False,
             )
+        if "requested format is not available" in lowered:
+            return TrackExtractionError(
+                "No playable audio format is available for this video.",
+                message,
+                retryable=False,
+            )
         return TrackExtractionError("Could not extract this track from YouTube.", message)
 
     @classmethod
-    def _extract_track_sync(cls, query: str, cookies_path: str) -> Dict[str, Any]:
+    def _extract_track_sync(
+        cls,
+        query: str,
+        cookies_path: str,
+        format_override: Optional[str] = None,
+    ) -> Dict[str, Any]:
         ydl_options = dict(YTDL_OPTIONS)
         ydl_options["cookiefile"] = cookies_path
+        if format_override:
+            ydl_options["format"] = format_override
 
         with yt_dlp.YoutubeDL(ydl_options) as ydl:
             try:
@@ -604,3 +637,4 @@ class Music(commands.Cog):
 async def setup(bot: commands.Bot):
     """Setup function for cog loading."""
     await bot.add_cog(Music(bot, bot.db, bot.config))
+
