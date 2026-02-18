@@ -11,6 +11,7 @@ YouTube cookies setup (required for authenticated access):
 
 import asyncio
 import logging
+import os
 import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -35,8 +36,11 @@ except ImportError:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
+PRIMARY_AUDIO_FORMAT = "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best"
+FALLBACK_AUDIO_FORMAT = "bestaudio/best"
+
 YTDL_OPTIONS = {
-    "format": "bestaudio/best",
+    "format": PRIMARY_AUDIO_FORMAT,
     "noplaylist": True,
     "quiet": True,
     "no_warnings": True,
@@ -56,7 +60,7 @@ FFMPEG_OPTIONS = {
 COOKIES_FILE_NAME = "cookies.txt"
 EXTRACTION_RETRIES = 2
 EXTRACTION_RETRY_DELAY_SECONDS = 1.0
-FALLBACK_FORMAT = "best"
+YTDLP_DEBUG_ENV = "YTDLP_DEBUG"
 
 
 class TrackExtractionError(Exception):
@@ -178,18 +182,31 @@ class Music(commands.Cog):
 
     @classmethod
     def _extract_track_sync_with_fallback(cls, query: str, cookies_path: str) -> Dict[str, Any]:
-        try:
-            return cls._extract_track_sync(query, cookies_path)
-        except TrackExtractionError as primary_error:
-            if not cls._is_requested_format_unavailable(primary_error):
-                raise
+        requested_formats = [PRIMARY_AUDIO_FORMAT, FALLBACK_AUDIO_FORMAT]
 
-            logger.warning(
-                "Primary yt-dlp format failed for query '%s'. Falling back to format '%s'.",
-                query,
-                FALLBACK_FORMAT,
-            )
-            return cls._extract_track_sync(query, cookies_path, format_override=FALLBACK_FORMAT)
+        for idx, format_string in enumerate(requested_formats):
+            try:
+                return cls._extract_track_sync(query, cookies_path, format_override=format_string)
+            except TrackExtractionError as format_error:
+                if not cls._is_requested_format_unavailable(format_error):
+                    raise
+
+                if idx < len(requested_formats) - 1:
+                    logger.warning(
+                        "yt-dlp format '%s' unavailable for query '%s'. Retrying with '%s'.",
+                        format_string,
+                        query,
+                        requested_formats[idx + 1],
+                    )
+                    continue
+
+                logger.warning(
+                    "yt-dlp selector formats failed for query '%s'. Falling back to direct audio format selection.",
+                    query,
+                )
+                return cls._extract_track_sync(query, cookies_path, allow_selector=False)
+
+        raise TrackExtractionError("Could not extract this track from YouTube.", retryable=False)
 
     @staticmethod
     def _classify_extraction_error(raw_error: Exception) -> TrackExtractionError:
@@ -227,17 +244,111 @@ class Music(commands.Cog):
             )
         return TrackExtractionError("Could not extract this track from YouTube.", message)
 
+    @staticmethod
+    def _pick_best_audio_format(formats: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        candidates: List[Dict[str, Any]] = []
+        for fmt in formats:
+            if not fmt.get("url"):
+                continue
+            if fmt.get("acodec") in (None, "none"):
+                continue
+            candidates.append(fmt)
+
+        if not candidates:
+            return None
+
+        def score(fmt: Dict[str, Any]) -> tuple:
+            ext = fmt.get("ext") or ""
+            ext_score = 2 if ext == "m4a" else 1 if ext == "webm" else 0
+            audio_only_score = 1 if (fmt.get("vcodec") in (None, "none")) else 0
+            bitrate_score = float(fmt.get("abr") or fmt.get("tbr") or 0)
+            return (audio_only_score, ext_score, bitrate_score)
+
+        return max(candidates, key=score)
+
+    @staticmethod
+    def _format_label(format_info: Optional[Dict[str, Any]]) -> str:
+        if not format_info:
+            return "unknown"
+        format_id = format_info.get("format_id", "unknown")
+        ext = format_info.get("ext", "unknown")
+        abr = format_info.get("abr") or format_info.get("tbr") or "?"
+        return f"id={format_id}, ext={ext}, abr={abr}"
+
+    @classmethod
+    def _normalize_track_info(
+        cls,
+        info: Dict[str, Any],
+        query: str,
+        requested_format: str,
+        allow_selector: bool,
+    ) -> Dict[str, Any]:
+        if not info:
+            raise TrackExtractionError("No results found for this query.", "No extraction info returned", retryable=False)
+
+        if "entries" in info:
+            info = next((entry for entry in info["entries"] if entry), None)
+            if not info:
+                raise TrackExtractionError("No results found for this query.", "No playable entry in results", retryable=False)
+
+        selected_format: Optional[Dict[str, Any]] = None
+        stream_url = info.get("url")
+        if not stream_url or not allow_selector:
+            selected_format = cls._pick_best_audio_format(info.get("formats") or [])
+            if not selected_format:
+                raise TrackExtractionError(
+                    "No playable audio format is available for this video.",
+                    "No audio format with stream URL found",
+                    retryable=False,
+                )
+            stream_url = selected_format.get("url")
+
+        if not stream_url:
+            raise TrackExtractionError(
+                "Could not create a playable stream URL for this track.",
+                "No playable stream URL found",
+                retryable=False,
+            )
+
+        chosen_format = selected_format or {
+            "format_id": info.get("format_id"),
+            "ext": info.get("ext"),
+            "abr": info.get("abr") or info.get("tbr"),
+        }
+        logger.info(
+            "yt-dlp extraction succeeded for query '%s'. requested_format='%s', chosen_format='%s'",
+            query,
+            requested_format,
+            cls._format_label(chosen_format),
+        )
+
+        return {
+            "title": info.get("title") or query,
+            "webpage_url": info.get("webpage_url") or query,
+            "stream_url": stream_url,
+            "duration": info.get("duration"),
+        }
+
     @classmethod
     def _extract_track_sync(
         cls,
         query: str,
         cookies_path: str,
         format_override: Optional[str] = None,
+        allow_selector: bool = True,
     ) -> Dict[str, Any]:
         ydl_options = dict(YTDL_OPTIONS)
         ydl_options["cookiefile"] = cookies_path
-        if format_override:
-            ydl_options["format"] = format_override
+        if allow_selector:
+            ydl_options["format"] = format_override or PRIMARY_AUDIO_FORMAT
+        else:
+            ydl_options.pop("format", None)
+
+        logger.info(
+            "Attempting yt-dlp extraction for query '%s' with format='%s'",
+            query,
+            ydl_options.get("format", "<auto-audio-pick>"),
+        )
 
         with yt_dlp.YoutubeDL(ydl_options) as ydl:
             try:
@@ -245,28 +356,52 @@ class Music(commands.Cog):
             except Exception as e:
                 raise cls._classify_extraction_error(e) from e
 
+            return cls._normalize_track_info(
+                info,
+                query,
+                requested_format=ydl_options.get("format", "<auto-audio-pick>"),
+                allow_selector=allow_selector,
+            )
+
+    @classmethod
+    def _list_available_formats_sync(cls, query: str, cookies_path: str) -> Dict[str, Any]:
+        ydl_options = dict(YTDL_OPTIONS)
+        ydl_options["cookiefile"] = cookies_path
+        ydl_options.pop("format", None)
+
+        with yt_dlp.YoutubeDL(ydl_options) as ydl:
+            info = ydl.extract_info(query, download=False)
+
+        if not info:
+            raise TrackExtractionError("No results found for this query.", "No extraction info returned", retryable=False)
+
+        if "entries" in info:
+            info = next((entry for entry in info["entries"] if entry), None)
             if not info:
-                raise TrackExtractionError("No results found for this query.", "No extraction info returned", retryable=False)
+                raise TrackExtractionError("No results found for this query.", "No playable entry in results", retryable=False)
 
-            if "entries" in info:
-                info = next((entry for entry in info["entries"] if entry), None)
-                if not info:
-                    raise TrackExtractionError("No results found for this query.", "No playable entry in results", retryable=False)
+        formats = info.get("formats") or []
 
-            stream_url = info.get("url")
-            if not stream_url:
-                raise TrackExtractionError(
-                    "Could not create a playable stream URL for this track.",
-                    "No playable stream URL found",
-                    retryable=False,
-                )
+        def sort_key(fmt: Dict[str, Any]) -> tuple:
+            has_audio = 1 if fmt.get("acodec") not in (None, "none") else 0
+            abr = float(fmt.get("abr") or fmt.get("tbr") or 0)
+            return (has_audio, abr)
 
-            return {
-                "title": info.get("title") or query,
-                "webpage_url": info.get("webpage_url") or query,
-                "stream_url": stream_url,
-                "duration": info.get("duration"),
-            }
+        sorted_formats = sorted(formats, key=sort_key, reverse=True)
+        lines: List[str] = []
+        for fmt in sorted_formats:
+            fmt_id = str(fmt.get("format_id", "?"))
+            ext = str(fmt.get("ext", "?"))
+            acodec = str(fmt.get("acodec", "?"))
+            vcodec = str(fmt.get("vcodec", "?"))
+            abr = fmt.get("abr") or fmt.get("tbr") or "?"
+            lines.append(f"{fmt_id:>6} ext={ext:<5} acodec={acodec:<12} vcodec={vcodec:<12} br={abr}")
+
+        logger.info("yt-dlp formats for '%s':\n%s", query, "\n".join(lines[:30]))
+        return {
+            "title": info.get("title") or query,
+            "formats": lines,
+        }
 
     async def _refresh_stream_url(self, track: Dict[str, Any]) -> None:
         """Refresh stream URL for expired links."""
@@ -474,6 +609,70 @@ class Music(commands.Cog):
         )
         await interaction.followup.send(embed=embed)
         logger.info(f"Added to queue by {interaction.user}: {title}")
+
+    @app_commands.command(name="ytdlp_formats", description="Admin debug: list yt-dlp formats for a YouTube URL")
+    @app_commands.describe(url="YouTube URL")
+    @is_admin()
+    async def ytdlp_formats(self, interaction: discord.Interaction, url: str):
+        """List available yt-dlp formats for debugging on VPS."""
+        if yt_dlp is None:
+            await interaction.response.send_message(
+                embed=EmbedFactory.error("Dependency Missing", "yt-dlp is not installed. Run: pip install yt-dlp"),
+                ephemeral=True,
+            )
+            return
+
+        if os.getenv(YTDLP_DEBUG_ENV, "0") != "1":
+            await interaction.response.send_message(
+                embed=EmbedFactory.error(
+                    "Debug Disabled",
+                    f"Set {YTDLP_DEBUG_ENV}=1 in environment and restart the bot to use this command.",
+                ),
+                ephemeral=True,
+            )
+            return
+
+        if not self.cookies_path.is_file():
+            await interaction.response.send_message(
+                embed=EmbedFactory.error(
+                    "Missing cookies.txt",
+                    "cookies.txt was not found in the bot root directory.",
+                ),
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            format_data = await asyncio.to_thread(self._list_available_formats_sync, url, str(self.cookies_path))
+        except TrackExtractionError as e:
+            await interaction.followup.send(embed=EmbedFactory.error("Format Debug Error", e.user_message), ephemeral=True)
+            return
+        except Exception as e:
+            logger.error(f"Failed to list yt-dlp formats for '{url}': {e}", exc_info=True)
+            await interaction.followup.send(
+                embed=EmbedFactory.error("Format Debug Error", "Could not list formats for this URL."),
+                ephemeral=True,
+            )
+            return
+
+        max_block_chars = 1400
+        selected_lines: List[str] = []
+        used = 0
+        for line in format_data["formats"]:
+            next_size = len(line) + 1
+            if used + next_size > max_block_chars:
+                break
+            selected_lines.append(line)
+            used += next_size
+
+        list_text = "\n".join(selected_lines) if selected_lines else "No formats found."
+        summary = (
+            f"Title: {format_data['title']}\n"
+            f"Showing {len(selected_lines)} of {len(format_data['formats'])} formats."
+        )
+        await interaction.followup.send(f"{summary}\n```text\n{list_text}\n```", ephemeral=True)
 
     @app_commands.command(name="join", description="Join your voice channel")
     async def join(self, interaction: discord.Interaction):
