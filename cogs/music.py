@@ -572,10 +572,12 @@ class Music(commands.Cog):
             if vc and vc.channel != user_channel:
                 await vc.move_to(user_channel)
             elif not vc:
-                vc = await user_channel.connect()
+                vc = await user_channel.connect(timeout=20.0, reconnect=True)
         except Exception as e:
+            error_msg = str(e) or "Unknown error (check VPS logs or permissions)"
+            logger.error(f"Failed to join voice channel: {error_msg}", exc_info=True)
             await interaction.followup.send(
-                embed=EmbedFactory.error("Connection Failed", f"Could not join voice channel: {e}"),
+                embed=EmbedFactory.error("Connection Failed", f"Could not join voice channel: {error_msg}"),
                 ephemeral=True,
             )
             return

@@ -148,6 +148,7 @@ class Admin(commands.Cog):
     @is_admin()
     async def config(self, interaction: discord.Interaction):
         """View server configuration"""
+        await interaction.response.defer(ephemeral=True)
         guild_config = await self.db.get_guild(interaction.guild.id)
 
         if not guild_config:
