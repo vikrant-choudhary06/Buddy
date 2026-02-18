@@ -37,7 +37,7 @@ except ImportError:  # pragma: no cover
 logger = logging.getLogger(__name__)
 
 PRIMARY_AUDIO_FORMAT = "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best"
-FALLBACK_AUDIO_FORMAT = "bestaudio/best"
+FALLBACK_AUDIO_FORMAT = "bestaudio/best/ba/b"
 
 YTDL_OPTIONS = {
     "format": PRIMARY_AUDIO_FORMAT,
@@ -47,9 +47,15 @@ YTDL_OPTIONS = {
     "default_search": "ytsearch1",
     "skip_download": True,
     "cookiefile": "cookies.txt",
-    "extractor_args": {"youtube": {"player_client": ["android"]}},
+    "extractor_args": {
+        "youtube": {
+            "player_client": ["web", "mweb", "android", "ios"],
+            "player_skip": ["webpage", "configs"],
+        }
+    },
     "sleep_interval_requests": 1,
     "retries": 2,
+    "nocheckcertificate": True,
 }
 
 FFMPEG_OPTIONS = {
@@ -178,7 +184,8 @@ class Music(commands.Cog):
 
     @staticmethod
     def _is_requested_format_unavailable(raw_error: Exception) -> bool:
-        return "requested format is not available" in str(raw_error).lower()
+        lowered = str(raw_error).lower()
+        return "requested format is not available" in lowered or "no such format found" in lowered
 
     @classmethod
     def _extract_track_sync_with_fallback(cls, query: str, cookies_path: str) -> Dict[str, Any]:
@@ -236,7 +243,7 @@ class Music(commands.Cog):
                 message,
                 retryable=False,
             )
-        if "requested format is not available" in lowered:
+        if "requested format is not available" in lowered or "no such format found" in lowered:
             return TrackExtractionError(
                 "No playable audio format is available for this video.",
                 message,
@@ -250,7 +257,8 @@ class Music(commands.Cog):
         for fmt in formats:
             if not fmt.get("url"):
                 continue
-            if fmt.get("acodec") in (None, "none"):
+            if fmt.get("acodec") in (None, "none") and fmt.get("vcodec") in (None, "none"):
+                # Skip formats with no audio AND no video (shouldn't happen for valid entries)
                 continue
             candidates.append(fmt)
 
@@ -259,8 +267,11 @@ class Music(commands.Cog):
 
         def score(fmt: Dict[str, Any]) -> tuple:
             ext = fmt.get("ext") or ""
-            ext_score = 2 if ext == "m4a" else 1 if ext == "webm" else 0
+            # Higher preference for audio-only
             audio_only_score = 1 if (fmt.get("vcodec") in (None, "none")) else 0
+            # Preference for m4a > webm > others
+            ext_score = 2 if ext == "m4a" else 1 if ext == "webm" else 0
+            # Bitrate score
             bitrate_score = float(fmt.get("abr") or fmt.get("tbr") or 0)
             return (audio_only_score, ext_score, bitrate_score)
 
